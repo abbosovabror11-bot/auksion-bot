@@ -323,7 +323,6 @@ async def process_topup_receipt(message: Message, state: FSMContext):
         conn.commit()
         payment_id = cursor.lastrowid
 
-    # Adminga xabar yuborish
     admin_text = (
         f"🔔 <b>YANGI TO'LOV SO'ROVI! #id{payment_id}</b>\n\n"
         f"👤 Foydalanuvchi: <a href='tg://user?id={user_id}'>{html.quote(user_name)}</a> (<code>{user_id}</code>)\n"
@@ -352,7 +351,6 @@ async def process_topup_receipt(message: Message, state: FSMContext):
 async def process_topup_receipt_wrong(message: Message):
     await message.answer("⚠️ Iltimos, to'lov chekini rasm ko'rinishida yuboring!")
 
-# --- ADMIN PAYMENT APPROVAL ---
 @router.callback_query(F.data == "admin_pending_payments")
 async def process_admin_pending_payments(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
@@ -386,7 +384,6 @@ async def process_approve_pay(callback: CallbackQuery):
         user_id = pay["user_id"]
         stars_amount = pay["amount_stars"]
 
-        # Balansga qo'shish
         cursor.execute("UPDATE users SET bot_balance = bot_balance + ? WHERE user_id = ?", (stars_amount, user_id))
         cursor.execute("UPDATE payments SET status = 'approved' WHERE payment_id = ?", (payment_id,))
         conn.commit()
@@ -473,7 +470,6 @@ async def process_help_menu(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=Keyboards.back_home(), parse_mode="HTML")
     await callback.answer()
 
-# --- AUCTION CREATION (NFT & PRIZE) ---
 @router.callback_query(F.data == "create_auction")
 async def process_start_create_auction(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
@@ -538,7 +534,6 @@ async def process_auction_start_price(message: Message, state: FSMContext):
             0, "Hozircha yo'q", "active", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ))
         
-        # Kanalning auksionlar sonini oshirish
         cursor.execute("UPDATE channels SET total_auctions_count = total_auctions_count + 1 WHERE channel_id = ?", (data["channel_id"],))
         conn.commit()
         auction_id = cursor.lastrowid
@@ -573,7 +568,6 @@ async def process_auction_start_price(message: Message, state: FSMContext):
 
     await state.clear()
 
-# --- BIDDING METHODS (TELEGRAM STARS OR BOT BALANCE) ---
 @router.callback_query(F.data.startswith("paybid_"))
 async def process_pay_bid_options(callback: CallbackQuery):
     parts = callback.data.split("_")
@@ -590,7 +584,6 @@ async def process_pay_bid_options(callback: CallbackQuery):
         if stars_amount <= auction["current_price"]:
             return await callback.answer("❌ Tanlangan stavka joriy narxdan baland bo'lishi kerak!", show_alert=True)
 
-    # Foydalanuvchiga qaysi usulda to'lamoqchiligini tanlatamiz
     text = (
         f"⚡ <b>Stavka qilish: {stars_amount} Stars</b>\n\n"
         f"Qaysi usul orqali stavka qilmoqchisiz?"
@@ -598,14 +591,9 @@ async def process_pay_bid_options(callback: CallbackQuery):
     await callback.message.answer(text, reply_markup=Keyboards.auction_bid_options(auction_id, stars_amount), parse_mode="HTML")
     await callback.answer()
 
-# 1. Telegram Stars orqali to'lov (Invoice)
 @router.callback_query(F.data.startswith("bid_tg_"))
 async def process_bid_tg(callback: CallbackQuery):
-    # Bu yerda oddiygina oxirgi tanlangan summani topish uchun callback_data dan foydalanamiz yoki xabardan o'qiymiz
-    # Yoki to'g'ridan to'g'ri invoice ochish uchun xabardan summani olamiz
     try:
-        parts = callback.message.text.split(":")
-        # Xabardan summani ajratib olamiz
         line = [l for l in callback.message.text.split("\n") if "Stavka qilish" in l][0]
         stars_amount = int(''.join(filter(str.isdigit, line.split(":")[1])))
         auction_id = int(callback.data.split("_")[2])
@@ -645,7 +633,6 @@ async def process_successful_payment(message: Message):
     stars_amount = int(parts[2])
     finalize_bid(message, auction_id, stars_amount, message.from_user.id, message.from_user.full_name)
 
-# 2. Bot balansi (So'm orqali to'ldirilgan) orqali stavka qilish
 @router.callback_query(F.data.startswith("bid_bot_"))
 async def process_bid_bot(callback: CallbackQuery):
     try:
@@ -672,7 +659,6 @@ async def process_bid_bot(callback: CallbackQuery):
         if stars_amount <= auction["current_price"]:
             return await callback.answer("❌ Stavka joriy narxdan baland bo'lishi kerak!", show_alert=True)
 
-        # Balansdan ayirish
         cursor.execute("UPDATE users SET bot_balance = bot_balance - ? WHERE user_id = ?", (stars_amount, user_id))
         conn.commit()
 
@@ -717,7 +703,6 @@ def finalize_bid(message_obj, auction_id, stars_amount, user_id, user_name, is_b
     )
 
     bot_inst = message_obj.bot if hasattr(message_obj, 'bot') else message_obj
-    # Asynchronous sending/editing
     asyncio.create_task(update_channel_auction_msg(bot_inst, auction["channel_id"], auction["message_id"], auction_id, new_price, updated_text))
     if not is_bot_balance and hasattr(message_obj, 'answer'):
         asyncio.create_task(message_obj.answer(f"✅ Muvaffaqiyatli {stars_amount} Stars stavka qilindi!"))
@@ -757,7 +742,6 @@ async def process_list_active_auctions(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
 
-# --- ADMIN / CHANNEL OWNER PANEL & 95% / 5% COMMISSION SYSTEM ---
 @router.callback_query(F.data == "admin_panel")
 async def process_admin_panel(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
@@ -828,15 +812,13 @@ async def process_finish_auction(callback: CallbackQuery):
             return await callback.answer("❌ Bu auksionni faqat admin yoki kanal egasi tugatishi mumkin!", show_alert=True)
         
         total_price = auction["current_price"]
-        admin_share_stars = int(total_price * 0.05)      # 5%
-        channel_share = total_price * 0.95               # 95% kanal balansiga
+        admin_share_stars = int(total_price * 0.05)
+        channel_share = total_price * 0.95
 
         if admin_share_stars < 1 and total_price >= 20:
             admin_share_stars = 1
 
-        # 95% qismini kanal balansiga yozish
         cursor.execute("UPDATE channels SET balance = balance + ? WHERE channel_id = ?", (channel_share, auction["channel_id"]))
-        # Auksionni yopish
         cursor.execute("UPDATE auctions SET status = 'finished' WHERE auction_id = ?", (auction_id,))
         conn.commit()
 
@@ -905,10 +887,6 @@ async def execute_broadcast(message: Message, state: FSMContext):
     await message.answer(f"✅ Xabar yuborildi: {success} ta foydalanuvchiga.", reply_markup=Keyboards.admin_panel())
     await state.clear()
 
-# ==============================================================================
-# 6. WEB SERVER FOR RENDER
-# ==============================================================================
-
 async def handle_ping(request):
     return web.Response(text="Bot is running perfectly!", status=200)
 
@@ -921,10 +899,6 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info(f"Web server port {port} da ishga tushdi.")
-
-# ==============================================================================
-# 7. MAIN ENGINE
-# ==============================================================================
 
 async def main():
     bot = Bot(token=TOKEN)
