@@ -1,5 +1,5 @@
 # ==============================================================================
-# PROJECT: TELEGRAM STARS INVOICE AUCTION & 5% COMMISSION SYSTEM
+# PROJECT: TELEGRAM NFT & STARS AUCTION SYSTEM (DYNAMIC BUTTONS)
 # ARCHITECTURE: Modular Monolith with Asynchronous Core & Web Server (aiogram 3.x)
 # ==============================================================================
 
@@ -36,14 +36,14 @@ logging.basicConfig(
     stream=sys.stdout,
     format="[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"
 )
-logger = logging.getLogger("StarsInvoiceAuctionBot")
+logger = logging.getLogger("NFTAuctionBot")
 
 # ==============================================================================
 # 2. DATABASE MANAGER (SQLITE ENGINE)
 # ==============================================================================
 
 class Database:
-    def __init__(self, db_file: str = "stars_auction_bot.db"):
+    def __init__(self, db_file: str = "nft_auction_bot.db"):
         self.db_file = db_file
         self.init_db()
 
@@ -79,8 +79,8 @@ class Database:
                     creator_id INTEGER,
                     channel_id INTEGER,
                     message_id INTEGER,
-                    lot_name TEXT,
-                    lot_description TEXT,
+                    prize_name TEXT,
+                    nft_link TEXT,
                     current_price REAL,
                     current_leader_id INTEGER,
                     current_leader_name TEXT,
@@ -106,8 +106,8 @@ db = Database()
 
 class AuctionStates(StatesGroup):
     waiting_for_channel_id = State()
-    waiting_for_lot_name = State()
-    waiting_for_lot_desc = State()
+    waiting_for_prize_name = State()
+    waiting_for_nft_link = State()
     waiting_for_start_price = State()
 
 class AdminStates(StatesGroup):
@@ -143,19 +143,22 @@ class Keyboards:
         )
 
     @staticmethod
-    def auction_bid_keyboard(auction_id: int) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="⭐ +1 Star to'lash", callback_data=f"paybid_{auction_id}_1"),
-                    InlineKeyboardButton(text="⭐ +5 Stars to'lash", callback_data=f"paybid_{auction_id}_5")
-                ],
-                [
-                    InlineKeyboardButton(text="⭐ +10 Stars to'lash", callback_data=f"paybid_{auction_id}_10"),
-                    InlineKeyboardButton(text="🚀 +50 Stars to'lash", callback_data=f"paybid_{auction_id}_50")
-                ]
-            ]
-        )
+    def auction_bid_keyboard(auction_id: int, current_price: float) -> InlineKeyboardMarkup:
+        # Rasmda ko'rsatilgandek, joriy narxdan boshlab ketma-ket 10 ta tugma avtomatik hosil bo'ladi
+        p = int(current_price)
+        buttons = []
+        row = []
+        
+        for i in range(1, 11):
+            next_price = p + i
+            row.append(InlineKeyboardButton(text=f"{next_price} ⭐", callback_data=f"paybid_{auction_id}_{next_price}"))
+            if len(row) == 5:  # Bir qatorga 5 tadan tugma joylashadi
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
 
     @staticmethod
     def back_home() -> InlineKeyboardMarkup:
@@ -185,7 +188,7 @@ async def cmd_start(message: Message):
     is_admin = user.id in ADMIN_IDS
     await message.answer(
         f"Assalomu alaykum, <b>{html.quote(user.full_name)}</b>!\n\n"
-        "Telegram Stars orqali ishlovchi ommaviy kanal auksionlari botiga xush kelibsiz.",
+        "Telegram NFT va Stars auksionlari botiga xush kelibsiz.",
         reply_markup=Keyboards.main_menu(is_admin),
         parse_mode="HTML"
     )
@@ -239,13 +242,13 @@ async def process_help_menu(callback: CallbackQuery):
     text = (
         "📞 <b>Qo'llanma:</b>\n\n"
         "1. Botni kanalingizga admin qiling.\n"
-        "2. Auksion ochish tugmasini bosing.\n"
+        "2. Auksion ochish tugmasini bosing, sovrin nomi va NFT havolasini kiriting.\n"
         "3. Ishtirokchilar Telegram Stars orqali to'lov qilib stavka qo'shadilar."
     )
     await callback.message.edit_text(text, reply_markup=Keyboards.back_home(), parse_mode="HTML")
     await callback.answer()
 
-# --- AUCTION CREATION ---
+# --- AUCTION CREATION (NFT & PRIZE) ---
 @router.callback_query(F.data == "create_auction")
 async def process_start_create_auction(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
@@ -264,18 +267,21 @@ async def process_auction_channel(message: Message, state: FSMContext):
     except Exception as e:
         return await message.answer(f"⚠️ Xatolik: {e}\nBot kanalga admin qilinganligini tekshirib, qaytadan kiriting:")
     
-    await message.answer("📦 Auksion lotining nomini kiriting:")
-    await state.set_state(AuctionStates.waiting_for_lot_name)
+    await message.answer("🎁 <b>Sovrin nomini</b> kiriting (masalan: Telegram Username yoki NFT raqami):", parse_mode="HTML")
+    await state.set_state(AuctionStates.waiting_for_prize_name)
 
-@router.message(AuctionStates.waiting_for_lot_name)
-async def process_auction_lot_name(message: Message, state: FSMContext):
-    await state.update_data(lot_name=message.text)
-    await message.answer("📝 Lot tavsifini kiriting:")
-    await state.set_state(AuctionStates.waiting_for_lot_desc)
+@router.message(AuctionStates.waiting_for_prize_name)
+async def process_auction_prize_name(message: Message, state: FSMContext):
+    await state.update_data(prize_name=message.text)
+    await message.answer("🔗 Agar bu <b>Telegram NFT</b> bo'lsa uning havolasini (silkasini) yuboring. Agar NFT bo'lmasa <b>'yo'q'</b> deb yozib yuboring:", parse_mode="HTML")
+    await state.set_state(AuctionStates.waiting_for_nft_link)
 
-@router.message(AuctionStates.waiting_for_lot_desc)
-async def process_auction_lot_desc(message: Message, state: FSMContext):
-    await state.update_data(lot_desc=message.text)
+@router.message(AuctionStates.waiting_for_nft_link)
+async def process_auction_nft_link(message: Message, state: FSMContext):
+    link_text = message.text.strip()
+    nft_link = link_text if link_text.lower() != "yo'q" else "Mavjud emas"
+    await state.update_data(nft_link=nft_link)
+    
     await message.answer("💰 Boshlang'ich narxni kiriting (Stars miqdori, masalan: 10):")
     await state.set_state(AuctionStates.waiting_for_start_price)
 
@@ -288,6 +294,8 @@ async def process_auction_start_price(message: Message, state: FSMContext):
     
     data = await state.get_data()
     user_id = message.from_user.id
+    prize_name = data["prize_name"]
+    nft_link = data["nft_link"]
 
     with db.get_connection() as conn:
         cursor = conn.cursor()
@@ -298,39 +306,42 @@ async def process_auction_start_price(message: Message, state: FSMContext):
         """, (data["channel_id"], user_id, data["channel_title"], data["channel_username"]))
         
         cursor.execute("""
-            INSERT INTO auctions (creator_id, channel_id, message_id, lot_name, lot_description, current_price, current_leader_id, current_leader_name, status, created_at)
+            INSERT INTO auctions (creator_id, channel_id, message_id, prize_name, nft_link, current_price, current_leader_id, current_leader_name, status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            user_id, data["channel_id"], 0, data["lot_name"], data["lot_desc"], start_price,
+            user_id, data["channel_id"], 0, prize_name, nft_link, start_price,
             0, "Hozircha yo'q", "active", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ))
         conn.commit()
         auction_id = cursor.lastrowid
 
+    nft_line = f"🔗 NFT havola: <a href='{nft_link}'>Ko'rish</a>\n" if nft_link != "Mavjud emas" else ""
+
     auction_text = (
-        f"🔥 <b>YANGI AUKSION!</b>\n\n"
-        f"📦 Lot: <b>{data['lot_name']}</b>\n"
-        f"📄 Tavsif: {data['lot_desc']}\n"
+        f"🔥 <b>YANGI AUKSION BOSHLANDI!</b>\n\n"
+        f"🎁 Sovrin: <b>{prize_name}</b>\n"
+        f"{nft_line}"
         f"💰 Boshlang'ich narx: <b>{start_price} Stars</b>\n"
         f"👤 Etakchi: Hozircha yo'q\n\n"
-        f"Stavka qilish uchun pastdagi tugmani bosing:"
+        f"Stavka qilish uchun pastdagi tugmalardan birini bosing:"
     )
 
     try:
         sent_msg = await message.bot.send_message(
             chat_id=data["channel_id"],
             text=auction_text,
-            reply_markup=Keyboards.auction_bid_keyboard(auction_id),
-            parse_mode="HTML"
+            reply_markup=Keyboards.auction_bid_keyboard(auction_id, start_price),
+            parse_mode="HTML",
+            disable_web_page_preview=True
         )
         with db.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE auctions SET message_id = ? WHERE auction_id = ?", (sent_msg.message_id, auction_id))
             conn.commit()
             
-        await message.answer("✅ Auksion kanalingizga joylandi!", reply_markup=Keyboards.main_menu(message.from_user.id in ADMIN_IDS))
+        await message.answer("✅ Auksion kanalingizga muvaffaqiyatli joylandi!", reply_markup=Keyboards.main_menu(message.from_user.id in ADMIN_IDS))
     except Exception as e:
-        await message.answer(f"⚠️ Xatolik: {e}", reply_markup=Keyboards.main_menu(message.from_user.id in ADMIN_IDS))
+        await message.answer(f"⚠️ Xatolik yuz berdi: {e}", reply_markup=Keyboards.main_menu(message.from_user.id in ADMIN_IDS))
 
     await state.clear()
 
@@ -343,16 +354,22 @@ async def process_pay_bid(callback: CallbackQuery):
     
     with db.get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM auctions WHERE auction_id = ? AND status = 'active'", (auction_id,))
+        cursor.execute("SELECT * FROM auctions WHERE auction_id = ?", (auction_id,))
         auction = cursor.fetchone()
         
         if not auction:
-            return await callback.answer("❌ Bu auksion faol emas!", show_alert=True)
+            return await callback.answer("❌ Bu auksion bazadan topilmadi!", show_alert=True)
+        
+        if auction["status"] != "active":
+            return await callback.answer("❌ Bu auksion yopilgan!", show_alert=True)
+            
+        if stars_amount <= auction["current_price"]:
+            return await callback.answer("❌ Tanlangan stavka joriy narxdan baland bo'lishi kerak!", show_alert=True)
 
-    title = f"Auksion stavkasi: {auction['lot_name']}"
-    description = f"+{stars_amount} Stars qo'shish va yetakchi bo'lish."
+    title = f"Auksion stavkasi: {auction['prize_name']}"
+    description = f"{stars_amount} Stars to'lab yetakchi bo'lish."
     payload = f"auction_{auction_id}_{stars_amount}"
-    prices = [LabeledPrice(label="Stars", amount=stars_amount)] # XTR valyutasi uchun 1:1
+    prices = [LabeledPrice(label="Stars", amount=stars_amount)]
 
     try:
         await callback.message.bot.send_invoice(
@@ -391,7 +408,7 @@ async def process_successful_payment(message: Message):
         if not auction:
             return await message.answer("❌ Bu auksion allaqachon tugatilgan.")
         
-        new_price = auction["current_price"] + stars_amount
+        new_price = float(stars_amount)
         
         cursor.execute("""
             UPDATE auctions 
@@ -403,17 +420,20 @@ async def process_successful_payment(message: Message):
             UPDATE channels 
             SET total_bids_count = total_bids_count + 1, total_stars_generated = total_stars_generated + ?
             WHERE channel_id = ?
-        """, (stars_amount, auction["channel_id"]))
+        """, (new_price, auction["channel_id"]))
         
         conn.commit()
 
+    nft_link = auction["nft_link"]
+    nft_line = f"🔗 NFT havola: <a href='{nft_link}'>Ko'rish</a>\n" if nft_link != "Mavjud emas" else ""
+
     updated_text = (
         f"🔥 <b>YANGI AUKSION!</b>\n\n"
-        f"📦 Lot: <b>{auction['lot_name']}</b>\n"
-        f"📄 Tavsif: {auction['lot_description']}\n"
+        f"🎁 Sovrin: <b>{auction['prize_name']}</b>\n"
+        f"{nft_line}"
         f"💰 Joriy narx: <b>{new_price} Stars</b>\n"
         f"👤 Etakchi: <b>{user_name}</b>\n\n"
-        f"Stavka qilindi (+{stars_amount} Stars)!"
+        f"Oxirgi stavka: +{stars_amount} Stars!"
     )
 
     try:
@@ -421,13 +441,14 @@ async def process_successful_payment(message: Message):
             chat_id=auction["channel_id"],
             message_id=auction["message_id"],
             text=updated_text,
-            reply_markup=Keyboards.auction_bid_keyboard(auction_id),
-            parse_mode="HTML"
+            reply_markup=Keyboards.auction_bid_keyboard(auction_id, new_price),
+            parse_mode="HTML",
+            disable_web_page_preview=True
         )
     except Exception:
         pass
 
-    await message.answer(f"✅ Muvaffaqiyatli +{stars_amount} Star stavka qilindi!")
+    await message.answer(f"✅ Muvaffaqiyatli {stars_amount} Stars stavka qilindi!")
 
 @router.callback_query(F.data == "list_auctions")
 async def process_list_active_auctions(callback: CallbackQuery):
@@ -441,7 +462,7 @@ async def process_list_active_auctions(callback: CallbackQuery):
     else:
         text = "🔥 <b>Faol auksionlar:</b>\n\n"
         for auc in auctions:
-            text += f"▪️ <b>{auc['lot_name']}</b> — Narx: {auc['current_price']} Stars (Etakchi: {auc['current_leader_name']})\n"
+            text += f"▪️ <b>{auc['prize_name']}</b> — Narx: {auc['current_price']} Stars (Etakchi: {auc['current_leader_name']})\n"
 
     await callback.message.edit_text(text, reply_markup=Keyboards.back_home(), parse_mode="HTML")
     await callback.answer()
@@ -491,7 +512,7 @@ async def process_admin_manage_auctions(callback: CallbackQuery):
         text = "🛠️ <b>Auksionni tugatish va 5% komissiyani olish:</b>"
         buttons = []
         for auc in auctions:
-            buttons.append([InlineKeyboardButton(text=f"🏁 Yakunlash: {auc['lot_name']} ({auc['current_price']} Stars)", callback_data=f"finish_auc_{auc['auction_id']}")])
+            buttons.append([InlineKeyboardButton(text=f"🏁 Yakunlash: {auc['prize_name']} ({auc['current_price']} Stars)", callback_data=f"finish_auc_{auc['auction_id']}")])
         buttons.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="admin_panel")])
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -512,7 +533,6 @@ async def process_finish_auction(callback: CallbackQuery):
         if not auction:
             return await callback.answer("❌ Auksion topilmadi yoki allaqachon tugatilgan!", show_alert=True)
         
-        # Auksion tugaganda 5% komissiyani hisoblash
         total_price = auction["current_price"]
         admin_commission = total_price * (COMMISSION_PERCENT / 100.0)
         
@@ -524,9 +544,9 @@ async def process_finish_auction(callback: CallbackQuery):
         await callback.message.bot.send_message(
             chat_id=ADMIN_IDS[0],
             text=f"🏁 <b>Auksion yakunlandi!</b>\n"
-                 f"📦 Lot: {auction['lot_name']}\n"
+                 f"🎁 Sovrin: {auction['prize_name']}\n"
                  f"💰 Jami summa: {total_price} Stars\n"
-                 f"👑 Sizning 5% ulushingiz: <b>⭐ {admin_commission} Stars</b> profilingizga yozildi.",
+                 f"👑 Sizning 5% ulushingiz: <b>⭐ {admin_commission} Stars</b> yozildi.",
             parse_mode="HTML"
         )
     except Exception:
@@ -599,7 +619,7 @@ async def main():
     ], scope=BotCommandScopeDefault())
 
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Stars auksion boti ishga tushdi!")
+    logger.info("NFT Auksion boti ishga tushdi!")
     
     await start_web_server()
     await dp.start_polling(bot)
