@@ -1,5 +1,5 @@
 # ==============================================================================
-# PROJECT: TELEGRAM NFT & STARS AUCTION SYSTEM (DYNAMIC BUTTONS)
+# PROJECT: TELEGRAM NFT & STARS AUCTION WITH SUM BALANCE SYSTEM
 # ARCHITECTURE: Modular Monolith with Asynchronous Core & Web Server (aiogram 3.x)
 # ==============================================================================
 
@@ -29,7 +29,10 @@ from aiogram.exceptions import TelegramBadRequest
 
 TOKEN = "8655535261:AAETrrG_B7Q_DxChzSuFhaWZ8jnmmggtW4c"
 ADMIN_IDS = [8694110588]    # Sizning Telegram ID raqamingiz
-COMMISSION_PERCENT = 5.0   # Auksion tugaganda admin profiliga tushadigan foiz (%)
+
+CARD_NUMBER = "9860606756173831"
+CARD_HOLDER = "ABBOSOV ABRORBEK"
+SUM_PER_STAR = 180          # 1 Stars = 180 so'm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +63,7 @@ class Database:
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     full_name TEXT,
+                    bot_balance REAL DEFAULT 0.0,
                     joined_date TEXT
                 )
             """)
@@ -69,7 +73,8 @@ class Database:
                     owner_id INTEGER,
                     channel_title TEXT,
                     username TEXT,
-                    total_bids_count INTEGER DEFAULT 0,
+                    balance REAL DEFAULT 0.0,
+                    total_auctions_count INTEGER DEFAULT 0,
                     total_stars_generated REAL DEFAULT 0.0
                 )
             """)
@@ -89,12 +94,16 @@ class Database:
                 )
             """)
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS admin_wallet (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    earned_stars REAL DEFAULT 0.0
+                CREATE TABLE IF NOT EXISTS payments (
+                    payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    amount_sum REAL,
+                    amount_stars REAL,
+                    photo_id TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TEXT
                 )
             """)
-            cursor.execute("INSERT OR IGNORE INTO admin_wallet (id, earned_stars) VALUES (1, 0.0)")
             conn.commit()
         logger.info("Ma'lumotlar bazasi ishga tushirildi.")
 
@@ -110,6 +119,10 @@ class AuctionStates(StatesGroup):
     waiting_for_nft_link = State()
     waiting_for_start_price = State()
 
+class TopUpStates(StatesGroup):
+    waiting_for_sum = State()
+    waiting_for_receipt = State()
+
 class AdminStates(StatesGroup):
     waiting_for_broadcast_text = State()
 
@@ -123,7 +136,7 @@ class Keyboards:
         keyboard = [
             [InlineKeyboardButton(text="📢 O'z Kanalimda Auksion Ochish", callback_data="create_auction")],
             [InlineKeyboardButton(text="🔥 Faol Auksionlar", callback_data="list_auctions")],
-            [InlineKeyboardButton(text="⭐ Kabinetim", callback_data="user_balance"),
+            [InlineKeyboardButton(text="⭐ Kabinetim & Balans", callback_data="user_balance"),
              InlineKeyboardButton(text="🏆 Top-10 Kanallar", callback_data="top_channels")],
             [InlineKeyboardButton(text="📞 Qo'llanma & Yordam", callback_data="help_menu")]
         ]
@@ -135,16 +148,37 @@ class Keyboards:
     def admin_panel() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             inline_keyboard=[
+                [InlineKeyboardButton(text="💳 To'lov So'rovlarini Tasdiqlash", callback_data="admin_pending_payments")],
                 [InlineKeyboardButton(text="📊 To'liq Statistika", callback_data="admin_stats")],
-                [InlineKeyboardButton(text="🛠️ Auksionlarni Yakunlash / Boshqarish", callback_data="admin_manage_auctions")],
+                [InlineKeyboardButton(text="🛠️ Auksionlarni Boshqarish & Yakunlash", callback_data="admin_manage_auctions")],
                 [InlineKeyboardButton(text="✉️ Hammaga Xabar Yuborish", callback_data="admin_broadcast")],
                 [InlineKeyboardButton(text="◀️ Bosh Menyu", callback_data="back_home")]
             ]
         )
 
     @staticmethod
+    def balance_menu() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="💳 Balansni So'm orqali to'ldirish", callback_data="topup_sum")],
+                [InlineKeyboardButton(text="◀️ Orqaga", callback_data="back_home")]
+            ]
+        )
+
+    @staticmethod
+    def auction_bid_options(auction_id: int, current_price: float) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="⭐ Telegram Stars orqali", callback_data=f"bid_tg_{auction_id}"),
+                    InlineKeyboardButton(text="💳 Bot balansi (So'm/Star) orqali", callback_data=f"bid_bot_{auction_id}")
+                ],
+                [InlineKeyboardButton(text="◀️ Orqaga", callback_data="back_home")]
+            ]
+        )
+
+    @staticmethod
     def auction_bid_keyboard(auction_id: int, current_price: float) -> InlineKeyboardMarkup:
-        # Rasmda ko'rsatilgandek, joriy narxdan boshlab ketma-ket 10 ta tugma avtomatik hosil bo'ladi
         p = int(current_price)
         buttons = []
         row = []
@@ -152,7 +186,7 @@ class Keyboards:
         for i in range(1, 11):
             next_price = p + i
             row.append(InlineKeyboardButton(text=f"{next_price} ⭐", callback_data=f"paybid_{auction_id}_{next_price}"))
-            if len(row) == 5:  # Bir qatorga 5 tadan tugma joylashadi
+            if len(row) == 5:
                 buttons.append(row)
                 row = []
         if row:
@@ -180,7 +214,7 @@ async def cmd_start(message: Message):
         cursor.execute("SELECT * FROM users WHERE user_id = ?", (user.id,))
         if not cursor.fetchone():
             cursor.execute(
-                "INSERT INTO users (user_id, username, full_name, joined_date) VALUES (?, ?, ?, ?)",
+                "INSERT INTO users (user_id, username, full_name, bot_balance, joined_date) VALUES (?, ?, ?, 0.0, ?)",
                 (user.id, user.username, user.full_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             )
             conn.commit()
@@ -211,13 +245,201 @@ async def process_back_home(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "user_balance")
 async def process_user_balance(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        user_row = cursor.fetchone()
+        bot_balance = user_row["bot_balance"] if user_row else 0.0
+
+        cursor.execute("SELECT * FROM channels WHERE owner_id = ?", (user_id,))
+        channels = cursor.fetchall()
+
     text = (
-        f"👤 <b>Shaxsiy kabinet:</b>\n\n"
-        f"🆔 ID: <code>{callback.from_user.id}</code>\n"
-        f"⭐ To'lovlar Telegram Stars orqali bevosita amalga oshiriladi."
+        f"👤 <b>Shaxsiy kabinet va balans:</b>\n\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"⭐ Botdagi balansingiz: <b>{bot_balance} Stars</b>\n\n"
     )
-    await callback.message.edit_text(text, reply_markup=Keyboards.back_home(), parse_mode="HTML")
+    if not channels:
+        text += "Sizda hali kanallar va ularning balanslari mavjud emas."
+    else:
+        text += "<b>Kanadlaringizdagi mablag'lar (95% qismi):</b>\n"
+        for ch in channels:
+            title = html.quote(ch['channel_title'] or "Kanal")
+            text += f"▪️ <b>{title}</b> — ⭐ {ch['balance']} Stars\n"
+
+    await callback.message.edit_text(text, reply_markup=Keyboards.balance_menu(), parse_mode="HTML")
     await callback.answer()
+
+# --- TOP UP BALANCE VIA SUM ---
+@router.callback_query(F.data == "topup_sum")
+async def process_topup_sum(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        f"💳 <b>Balansni to'ldirish</b>\n\n"
+        f"Kurs: <b>1 Star = {SUM_PER_STAR} so'm</b>\n"
+        f"Karta raqami: <code>{CARD_NUMBER}</code>\n"
+        f"Karta egasi: <b>{CARD_HOLDER}</b>\n\n"
+        f"Iltimos, kartaga o'tkazmoqchi bo'lgan <b>so'm miqdorini</b> kiriting (masalan: 18000):",
+        parse_mode="HTML"
+    )
+    await state.set_state(TopUpStates.waiting_for_sum)
+    await callback.answer()
+
+@router.message(TopUpStates.waiting_for_sum)
+async def process_topup_sum_input(message: Message, state: FSMContext):
+    try:
+        sum_amount = float(message.text.strip())
+        if sum_amount <= 0:
+            raise ValueError()
+    except ValueError:
+        return await message.answer("⚠️ Iltimos, to'g'ri raqam kiriting (masalan: 18000):")
+
+    stars_amount = sum_amount / SUM_PER_STAR
+    await state.update_data(sum_amount=sum_amount, stars_amount=stars_amount)
+
+    await message.answer(
+        f"Siz kiritgan summa: <b>{sum_amount} so'm</b>\n"
+        f"Hisobingizga tushadigan Stars: <b>{stars_amount:.2f} ⭐</b>\n\n"
+        f"Karta raqamiga pulni o'tkazing va to'lovni tasdiqlovchi <b>chekni (skrinshotni)</b> rasm ko'rinishida yuboring:",
+        parse_mode="HTML"
+    )
+    await state.set_state(TopUpStates.waiting_for_receipt)
+
+@router.message(TopUpStates.waiting_for_receipt, F.photo)
+async def process_topup_receipt(message: Message, state: FSMContext):
+    data = await state.get_data()
+    sum_amount = data["sum_amount"]
+    stars_amount = data["stars_amount"]
+    photo_id = message.photo[-1].file_id
+    user_id = message.from_user.id
+    user_name = message.from_user.full_name
+
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO payments (user_id, amount_sum, amount_stars, photo_id, status, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?)
+        """, (user_id, sum_amount, stars_amount, photo_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        payment_id = cursor.lastrowid
+
+    # Adminga xabar yuborish
+    admin_text = (
+        f"🔔 <b>YANGI TO'LOV SO'ROVI! #id{payment_id}</b>\n\n"
+        f"👤 Foydalanuvchi: <a href='tg://user?id={user_id}'>{html.quote(user_name)}</a> (<code>{user_id}</code>)\n"
+        f"💰 Summa: <b>{sum_amount} so'm</b>\n"
+        f"⭐ Berilishi kerak: <b>{stars_amount:.2f} Stars</b>"
+    )
+    admin_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"approve_pay_{payment_id}"),
+                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"reject_pay_{payment_id}")
+            ]
+        ]
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await message.bot.send_photo(chat_id=admin_id, photo=photo_id, caption=admin_text, reply_markup=admin_kb, parse_mode="HTML")
+        except Exception:
+            pass
+
+    await message.answer("✅ Chekingiz adminga yuborildi! Admin tasdiqlagach, balansingizga avtomatik qo'shiladi.", reply_markup=Keyboards.main_menu(message.from_user.id in ADMIN_IDS))
+    await state.clear()
+
+@router.message(TopUpStates.waiting_for_receipt)
+async def process_topup_receipt_wrong(message: Message):
+    await message.answer("⚠️ Iltimos, to'lov chekini rasm ko'rinishida yuboring!")
+
+# --- ADMIN PAYMENT APPROVAL ---
+@router.callback_query(F.data == "admin_pending_payments")
+async def process_admin_pending_payments(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        return await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM payments WHERE status = 'pending'")
+        payments = cursor.fetchall()
+
+    if not payments:
+        return await callback.message.edit_text("📭 Hozircha kutilayotgan to'lovlar yo'q.", reply_markup=Keyboards.admin_panel())
+
+    await callback.message.edit_text(f"📋 Kutilayotgan to'lovlar soni: {len(payments)} ta. Ularni ko'rib chiqish uchun admin chatdagi rasmlarga qarang.", reply_markup=Keyboards.admin_panel())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("approve_pay_"))
+async def process_approve_pay(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        return await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+
+    payment_id = int(callback.data.split("_")[2])
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM payments WHERE payment_id = ? AND status = 'pending'", (payment_id,))
+        pay = cursor.fetchone()
+
+        if not pay:
+            return await callback.answer("❌ Bu to'lov topilmadi yoki allaqachon ko'rib chiqilgan!", show_alert=True)
+
+        user_id = pay["user_id"]
+        stars_amount = pay["amount_stars"]
+
+        # Balansga qo'shish
+        cursor.execute("UPDATE users SET bot_balance = bot_balance + ? WHERE user_id = ?", (stars_amount, user_id))
+        cursor.execute("UPDATE payments SET status = 'approved' WHERE payment_id = ?", (payment_id,))
+        conn.commit()
+
+    try:
+        await callback.message.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ Sizning to'lovingiz tasdiqlandi! Balansingizga <b>{stars_amount:.2f} Stars</b> qo'shildi.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    await callback.message.edit_caption(
+        caption=callback.message.caption + "\n\n<b>✅ TASDIQLANDI VA BALANSGA TUSHIRILDI</b>",
+        reply_markup=None,
+        parse_mode="HTML"
+    )
+    await callback.answer("To'lov muvaffaqiyatli tasdiqlandi!")
+
+@router.callback_query(F.data.startswith("reject_pay_"))
+async def process_reject_pay(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        return await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
+
+    payment_id = int(callback.data.split("_")[2])
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM payments WHERE payment_id = ? AND status = 'pending'", (payment_id,))
+        pay = cursor.fetchone()
+
+        if not pay:
+            return await callback.answer("❌ Bu to'lov topilmadi!", show_alert=True)
+
+        user_id = pay["user_id"]
+        cursor.execute("UPDATE payments SET status = 'rejected' WHERE payment_id = ?", (payment_id,))
+        conn.commit()
+
+    try:
+        await callback.message.bot.send_message(
+            chat_id=user_id,
+            text="❌ Afsuski, to'lov chekingiz admin tomonidan rad etildi. Savollar bo'lsa admin bilan bog'laning.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    await callback.message.edit_caption(
+        caption=callback.message.caption + "\n\n<b>❌ RAD ETILDI</b>",
+        reply_markup=None,
+        parse_mode="HTML"
+    )
+    await callback.answer("To'lov rad etildi.")
 
 @router.callback_query(F.data == "top_channels")
 async def process_top_channels(callback: CallbackQuery):
@@ -229,10 +451,12 @@ async def process_top_channels(callback: CallbackQuery):
     if not channels:
         text = "🏆 <b>Hozircha reytingda kanallar mavjud emas.</b>"
     else:
-        text = "🏆 <b>Top-10 Kanallar:</b>\n\n"
+        text = "🏆 <b>Top-10 Kanallar (Auksionlar va Yig'ilgan Stars):</b>\n\n"
         for idx, ch in enumerate(channels, 1):
             title = html.quote(ch['channel_title'] or "Kanal")
-            text += f"{idx}. <b>{title}</b> — ⭐ {ch['total_stars_generated']} Stars\n"
+            total_auc = ch['total_auctions_count'] or 0
+            total_stars = ch['total_stars_generated'] or 0.0
+            text += f"{idx}. <b>{title}</b>\n   ▫️ Auksionlar soni: {total_auc} ta\n   ▫️ Yig'ilgan stars: ⭐ {total_stars}\n\n"
 
     await callback.message.edit_text(text, reply_markup=Keyboards.back_home(), parse_mode="HTML")
     await callback.answer()
@@ -243,7 +467,8 @@ async def process_help_menu(callback: CallbackQuery):
         "📞 <b>Qo'llanma:</b>\n\n"
         "1. Botni kanalingizga admin qiling.\n"
         "2. Auksion ochish tugmasini bosing, sovrin nomi va NFT havolasini kiriting.\n"
-        "3. Ishtirokchilar Telegram Stars orqali to'lov qilib stavka qo'shadilar."
+        "3. Ishtirokchilar Telegram Stars yoki so'm orqali to'ldirilgan bot balansi bilan stavka qo'shadilar.\n"
+        "4. Auksion yakunlanganda 95% kanal balansiga tushadi, 5% esa bevosita sizning Telegram profilingizga yuboriladi."
     )
     await callback.message.edit_text(text, reply_markup=Keyboards.back_home(), parse_mode="HTML")
     await callback.answer()
@@ -302,7 +527,7 @@ async def process_auction_start_price(message: Message, state: FSMContext):
         cursor.execute("""
             INSERT INTO channels (channel_id, owner_id, channel_title, username) 
             VALUES (?, ?, ?, ?) 
-            ON CONFLICT(channel_id) DO UPDATE SET channel_title = excluded.channel_title
+            ON CONFLICT(channel_id) DO UPDATE SET channel_title = excluded.channel_title, owner_id = excluded.owner_id
         """, (data["channel_id"], user_id, data["channel_title"], data["channel_username"]))
         
         cursor.execute("""
@@ -312,6 +537,9 @@ async def process_auction_start_price(message: Message, state: FSMContext):
             user_id, data["channel_id"], 0, prize_name, nft_link, start_price,
             0, "Hozircha yo'q", "active", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ))
+        
+        # Kanalning auksionlar sonini oshirish
+        cursor.execute("UPDATE channels SET total_auctions_count = total_auctions_count + 1 WHERE channel_id = ?", (data["channel_id"],))
         conn.commit()
         auction_id = cursor.lastrowid
 
@@ -323,7 +551,7 @@ async def process_auction_start_price(message: Message, state: FSMContext):
         f"{nft_line}"
         f"💰 Boshlang'ich narx: <b>{start_price} Stars</b>\n"
         f"👤 Etakchi: Hozircha yo'q\n\n"
-        f"Stavka qilish uchun pastdagi tugmalardan birini bosing:"
+        f"Stavka qilish uchun pastdagi tugmani bosing:"
     )
 
     try:
@@ -345,28 +573,46 @@ async def process_auction_start_price(message: Message, state: FSMContext):
 
     await state.clear()
 
-# --- TELEGRAM STARS INVOICE PAYMENT FOR BIDS ---
+# --- BIDDING METHODS (TELEGRAM STARS OR BOT BALANCE) ---
 @router.callback_query(F.data.startswith("paybid_"))
-async def process_pay_bid(callback: CallbackQuery):
+async def process_pay_bid_options(callback: CallbackQuery):
     parts = callback.data.split("_")
     auction_id = int(parts[1])
     stars_amount = int(parts[2])
-    
+
     with db.get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM auctions WHERE auction_id = ?", (auction_id,))
         auction = cursor.fetchone()
         
-        if not auction:
-            return await callback.answer("❌ Bu auksion bazadan topilmadi!", show_alert=True)
-        
-        if auction["status"] != "active":
-            return await callback.answer("❌ Bu auksion yopilgan!", show_alert=True)
-            
+        if not auction or auction["status"] != "active":
+            return await callback.answer("❌ Bu auksion faol emas!", show_alert=True)
         if stars_amount <= auction["current_price"]:
             return await callback.answer("❌ Tanlangan stavka joriy narxdan baland bo'lishi kerak!", show_alert=True)
 
-    title = f"Auksion stavkasi: {auction['prize_name']}"
+    # Foydalanuvchiga qaysi usulda to'lamoqchiligini tanlatamiz
+    text = (
+        f"⚡ <b>Stavka qilish: {stars_amount} Stars</b>\n\n"
+        f"Qaysi usul orqali stavka qilmoqchisiz?"
+    )
+    await callback.message.answer(text, reply_markup=Keyboards.auction_bid_options(auction_id, stars_amount), parse_mode="HTML")
+    await callback.answer()
+
+# 1. Telegram Stars orqali to'lov (Invoice)
+@router.callback_query(F.data.startswith("bid_tg_"))
+async def process_bid_tg(callback: CallbackQuery):
+    # Bu yerda oddiygina oxirgi tanlangan summani topish uchun callback_data dan foydalanamiz yoki xabardan o'qiymiz
+    # Yoki to'g'ridan to'g'ri invoice ochish uchun xabardan summani olamiz
+    try:
+        parts = callback.message.text.split(":")
+        # Xabardan summani ajratib olamiz
+        line = [l for l in callback.message.text.split("\n") if "Stavka qilish" in l][0]
+        stars_amount = int(''.join(filter(str.isdigit, line.split(":")[1])))
+        auction_id = int(callback.data.split("_")[2])
+    except Exception:
+        return await callback.answer("❌ Xatolik yuz berdi.", show_alert=True)
+
+    title = f"Auksion stavkasi"
     description = f"{stars_amount} Stars to'lab yetakchi bo'lish."
     payload = f"auction_{auction_id}_{stars_amount}"
     prices = [LabeledPrice(label="Stars", amount=stars_amount)]
@@ -397,16 +643,50 @@ async def process_successful_payment(message: Message):
     parts = payload.split("_")
     auction_id = int(parts[1])
     stars_amount = int(parts[2])
-    user_name = message.from_user.full_name
-    user_id = message.from_user.id
+    finalize_bid(message, auction_id, stars_amount, message.from_user.id, message.from_user.full_name)
 
+# 2. Bot balansi (So'm orqali to'ldirilgan) orqali stavka qilish
+@router.callback_query(F.data.startswith("bid_bot_"))
+async def process_bid_bot(callback: CallbackQuery):
+    try:
+        line = [l for l in callback.message.text.split("\n") if "Stavka qilish" in l][0]
+        stars_amount = float(''.join(filter(lambda x: x.isdigit() or x == '.', line.split(":")[1])))
+        auction_id = int(callback.data.split("_")[2])
+    except Exception:
+        return await callback.answer("❌ Xatolik yuz berdi.", show_alert=True)
+
+    user_id = callback.from_user.id
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT bot_balance FROM users WHERE user_id = ?", (user_id,))
+        user_row = cursor.fetchone()
+        bot_balance = user_row["bot_balance"] if user_row else 0.0
+
+        if bot_balance < stars_amount:
+            return await callback.answer(f"❌ Botdagi balansingiz yetarli emas! (Balans: {bot_balance} Stars)", show_value=True, show_alert=True)
+
+        cursor.execute("SELECT * FROM auctions WHERE auction_id = ? AND status = 'active'", (auction_id,))
+        auction = cursor.fetchone()
+        if not auction:
+            return await callback.answer("❌ Bu auksion faol emas!", show_alert=True)
+        if stars_amount <= auction["current_price"]:
+            return await callback.answer("❌ Stavka joriy narxdan baland bo'lishi kerak!", show_alert=True)
+
+        # Balansdan ayirish
+        cursor.execute("UPDATE users SET bot_balance = bot_balance - ? WHERE user_id = ?", (stars_amount, user_id))
+        conn.commit()
+
+    finalize_bid(callback.message, auction_id, stars_amount, user_id, callback.from_user.full_name, is_bot_balance=True)
+    await callback.answer("✅ Bot balansingizdan stavka qilindi!")
+
+def finalize_bid(message_obj, auction_id, stars_amount, user_id, user_name, is_bot_balance=False):
     with db.get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM auctions WHERE auction_id = ? AND status = 'active'", (auction_id,))
         auction = cursor.fetchone()
         
         if not auction:
-            return await message.answer("❌ Bu auksion allaqachon tugatilgan.")
+            return
         
         new_price = float(stars_amount)
         
@@ -418,7 +698,7 @@ async def process_successful_payment(message: Message):
         
         cursor.execute("""
             UPDATE channels 
-            SET total_bids_count = total_bids_count + 1, total_stars_generated = total_stars_generated + ?
+            SET total_stars_generated = total_stars_generated + ?
             WHERE channel_id = ?
         """, (new_price, auction["channel_id"]))
         
@@ -436,10 +716,17 @@ async def process_successful_payment(message: Message):
         f"Oxirgi stavka: +{stars_amount} Stars!"
     )
 
+    bot_inst = message_obj.bot if hasattr(message_obj, 'bot') else message_obj
+    # Asynchronous sending/editing
+    asyncio.create_task(update_channel_auction_msg(bot_inst, auction["channel_id"], auction["message_id"], auction_id, new_price, updated_text))
+    if not is_bot_balance and hasattr(message_obj, 'answer'):
+        asyncio.create_task(message_obj.answer(f"✅ Muvaffaqiyatli {stars_amount} Stars stavka qilindi!"))
+
+async def update_channel_auction_msg(bot, channel_id, message_id, auction_id, new_price, updated_text):
     try:
-        await message.bot.edit_message_text(
-            chat_id=auction["channel_id"],
-            message_id=auction["message_id"],
+        await bot.edit_message_text(
+            chat_id=channel_id,
+            message_id=message_id,
             text=updated_text,
             reply_markup=Keyboards.auction_bid_keyboard(auction_id, new_price),
             parse_mode="HTML",
@@ -447,8 +734,6 @@ async def process_successful_payment(message: Message):
         )
     except Exception:
         pass
-
-    await message.answer(f"✅ Muvaffaqiyatli {stars_amount} Stars stavka qilindi!")
 
 @router.callback_query(F.data == "list_auctions")
 async def process_list_active_auctions(callback: CallbackQuery):
@@ -459,15 +744,20 @@ async def process_list_active_auctions(callback: CallbackQuery):
 
     if not auctions:
         text = "📭 Hozirda faol auksionlar mavjud emas."
+        keyboard = Keyboards.back_home()
     else:
-        text = "🔥 <b>Faol auksionlar:</b>\n\n"
+        text = "🔥 <b>Faol auksionlar va ularni tugatish:</b>\n\n"
+        buttons = []
         for auc in auctions:
             text += f"▪️ <b>{auc['prize_name']}</b> — Narx: {auc['current_price']} Stars (Etakchi: {auc['current_leader_name']})\n"
+            buttons.append([InlineKeyboardButton(text=f"🏁 Tugatish: {auc['prize_name']} ({auc['current_price']} ⭐)", callback_data=f"finish_auc_{auc['auction_id']}")])
+        buttons.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="back_home")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    await callback.message.edit_text(text, reply_markup=Keyboards.back_home(), parse_mode="HTML")
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     await callback.answer()
 
-# --- ADMIN PANEL & 5% COMMISSION SYSTEM ---
+# --- ADMIN / CHANNEL OWNER PANEL & 95% / 5% COMMISSION SYSTEM ---
 @router.callback_query(F.data == "admin_panel")
 async def process_admin_panel(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
@@ -484,13 +774,11 @@ async def process_admin_stats(callback: CallbackQuery):
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) as cnt FROM users")
         users_count = cursor.fetchone()["cnt"]
-        cursor.execute("SELECT earned_stars FROM admin_wallet WHERE id = 1")
-        admin_stars = cursor.fetchone()["earned_stars"]
 
     text = (
         f"📊 <b>Statistika:</b>\n\n"
         f"👥 Foydalanuvchilar: <b>{users_count} ta</b>\n"
-        f"👑 Komissiyadan (5%) tushgan Stars: <b>⭐ {admin_stars} ta</b>"
+        f"👑 5% ulushlar bevosita Telegram'dagi Yulduzlar (Stars) profilingizga tushadi."
     )
     await callback.message.edit_text(text, reply_markup=Keyboards.admin_panel(), parse_mode="HTML")
     await callback.answer()
@@ -509,10 +797,10 @@ async def process_admin_manage_auctions(callback: CallbackQuery):
         text = "📭 Faol auksionlar yo'q."
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Orqaga", callback_data="admin_panel")]])
     else:
-        text = "🛠️ <b>Auksionni tugatish va 5% komissiyani olish:</b>"
+        text = "🛠️ <b>Auksionni tugatish va 95% / 5% ga taqsimlash:</b>"
         buttons = []
         for auc in auctions:
-            buttons.append([InlineKeyboardButton(text=f"🏁 Yakunlash: {auc['prize_name']} ({auc['current_price']} Stars)", callback_data=f"finish_auc_{auc['auction_id']}")])
+            buttons.append([InlineKeyboardButton(text=f"🏁 Yakunlash: {auc['prize_name']} ({auc['current_price']} ⭐)", callback_data=f"finish_auc_{auc['auction_id']}")])
         buttons.append([InlineKeyboardButton(text="◀️ Orqaga", callback_data="admin_panel")])
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -521,10 +809,9 @@ async def process_admin_manage_auctions(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("finish_auc_"))
 async def process_finish_auction(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        return await callback.answer("❌ Ruxsat yo'q!", show_alert=True)
-    
     auction_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
     with db.get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM auctions WHERE auction_id = ? AND status = 'active'", (auction_id,))
@@ -533,27 +820,59 @@ async def process_finish_auction(callback: CallbackQuery):
         if not auction:
             return await callback.answer("❌ Auksion topilmadi yoki allaqachon tugatilgan!", show_alert=True)
         
-        total_price = auction["current_price"]
-        admin_commission = total_price * (COMMISSION_PERCENT / 100.0)
+        cursor.execute("SELECT owner_id FROM channels WHERE channel_id = ?", (auction["channel_id"],))
+        ch_owner = cursor.fetchone()
+        owner_id = ch_owner["owner_id"] if ch_owner else 0
+
+        if user_id not in ADMIN_IDS and user_id != owner_id:
+            return await callback.answer("❌ Bu auksionni faqat admin yoki kanal egasi tugatishi mumkin!", show_alert=True)
         
-        cursor.execute("UPDATE admin_wallet SET earned_stars = earned_stars + ? WHERE id = 1", (admin_commission,))
+        total_price = auction["current_price"]
+        admin_share_stars = int(total_price * 0.05)      # 5%
+        channel_share = total_price * 0.95               # 95% kanal balansiga
+
+        if admin_share_stars < 1 and total_price >= 20:
+            admin_share_stars = 1
+
+        # 95% qismini kanal balansiga yozish
+        cursor.execute("UPDATE channels SET balance = balance + ? WHERE channel_id = ?", (channel_share, auction["channel_id"]))
+        # Auksionni yopish
         cursor.execute("UPDATE auctions SET status = 'finished' WHERE auction_id = ?", (auction_id,))
         conn.commit()
 
+    if admin_share_stars > 0:
+        try:
+            await callback.message.bot.send_invoice(
+                chat_id=ADMIN_IDS[0],
+                title="Admin 5% Komissiyasi",
+                description=f"Auksion yakunlandi. {admin_share_stars} Stars ulushingiz.",
+                payload=f"admin_com_{auction_id}",
+                currency="XTR",
+                prices=[LabeledPrice(label="Komissiya", amount=admin_share_stars)]
+            )
+        except Exception as e:
+            logger.error(f"Adminga stars yuborishda xatolik: {e}")
+
     try:
-        await callback.message.bot.send_message(
-            chat_id=ADMIN_IDS[0],
-            text=f"🏁 <b>Auksion yakunlandi!</b>\n"
+        await callback.message.bot.edit_message_text(
+            chat_id=auction["channel_id"],
+            message_id=auction["message_id"],
+            text=f"🏁 <b>AUKSION YAKUNLANDI!</b>\n\n"
                  f"🎁 Sovrin: {auction['prize_name']}\n"
-                 f"💰 Jami summa: {total_price} Stars\n"
-                 f"👑 Sizning 5% ulushingiz: <b>⭐ {admin_commission} Stars</b> yozildi.",
+                 f"💰 Jami bank: {total_price} Stars\n"
+                 f"👑 G'olib: <b>{auction['current_leader_name']}</b>",
+            reply_markup=None,
             parse_mode="HTML"
         )
     except Exception:
         pass
 
-    await callback.answer("✅ Auksion muvaffaqiyatli yakunlandi va 5% komissiya olindi!", show_alert=True)
-    await process_admin_manage_auctions(callback)
+    await callback.answer(f"✅ Auksion yakunlandi!\n⭐ 95% ({channel_share} Stars) kanal balansiga, 5% adminga yuborildi.", show_alert=True)
+    
+    try:
+        await callback.message.edit_text("✅ Auksion muvaffaqiyatli yakunlandi va balanslar taqsimlandi.", reply_markup=Keyboards.back_home())
+    except Exception:
+        pass
 
 @router.callback_query(F.data == "admin_broadcast")
 async def process_admin_broadcast(callback: CallbackQuery, state: FSMContext):
